@@ -65,7 +65,7 @@ dependencies:
   crypto: ^3.0.7
   flutter_torrent_server:
     path: packages/flutter_torrent_server
-  file_picker: any
+  file_picker: ^11.0.2
   archive: ^4.0.7
   filesystem_picker: ^4.1.0
   permission_handler: ^12.0.1

@@ -193,7 +193,13 @@ class LocalProxyService {
     }
 
     final client = HttpClient();
-    client.autoUncompress = true; // Handle gzipped M3U8/Segments correctly
+    // true: Dart decompresses gzip responses and strips Content-Encoding from
+    // response headers — required so M3U8 content arrives as UTF-8 text we can
+    // parse and rewrite. The CDN sends gzip even without an explicit
+    // Accept-Encoding request header. Content-Length is NOT updated to reflect
+    // the decompressed size, so we MUST strip content-length from all proxy
+    // responses (see header copy loop below) to avoid ContentSizeException.
+    client.autoUncompress = true;
     client.badCertificateCallback = (cert, host, port) => true;
 
     try {
@@ -296,19 +302,25 @@ class LocalProxyService {
           ? 200
           : response.statusCode;
 
-      // Copy response headers; skip content-length and content-encoding for
-      // M3U8 responses since the rewritten body has a different size/encoding.
+      // Copy response headers.
+      // - content-length: always stripped. autoUncompress=true decompresses gzip
+      //   but leaves Content-Length at the compressed size; writing larger bytes
+      //   causes ContentSizeException. Dart falls back to chunked transfer.
+      // - content-encoding: always stripped. autoUncompress=true decompresses the
+      //   body but does NOT remove this header from response.headers. Forwarding
+      //   "Content-Encoding: gzip" with already-decompressed bytes causes mpv/FFmpeg
+      //   to attempt a second decompression and corrupt audio/video data. Audio
+      //   segments (.js) are text/javascript so CDNs gzip them; video segments
+      //   (.jpg) are image/jpeg so CDNs don't — this is why video played but audio
+      //   didn't before this fix.
       response.headers.forEach((name, values) {
         final lowerName = name.toLowerCase();
-        final skipForM3u8 =
-            isResponseM3u8 &&
-            (lowerName == 'content-length' || lowerName == 'content-encoding');
-        if (lowerName != 'transfer-encoding' &&
-            lowerName != 'access-control-allow-origin' &&
-            !skipForM3u8) {
-          for (final value in values) {
-            request.response.headers.add(name, value);
-          }
+        if (lowerName == 'content-length') return;
+        if (lowerName == 'content-encoding') return;
+        if (lowerName == 'transfer-encoding') return;
+        if (lowerName == 'access-control-allow-origin') return;
+        for (final value in values) {
+          request.response.headers.add(name, value);
         }
       });
       request.response.headers.add("Access-Control-Allow-Origin", "*");
@@ -337,7 +349,7 @@ class LocalProxyService {
     } catch (e) {
       if (kDebugMode) debugPrint("LocalProxyService: Proxy Request Error: $e");
       request.response.statusCode = HttpStatus.badGateway;
-      request.response.close();
+      await request.response.close();
     }
   }
 
@@ -542,10 +554,11 @@ class LocalProxyService {
         final content = utf8
             .decode(bytes.take(50).toList(), allowMalformed: true)
             .trim();
-        if (kDebugMode)
+        if (kDebugMode) {
           debugPrint(
             "[PROXY] M3U8 Validation Check: '${content.substring(0, content.length > 10 ? 10 : content.length)}...'",
           );
+        }
         return content.contains("#EXT");
       }
     } catch (e) {
@@ -578,11 +591,23 @@ class LocalProxyService {
           (resolved.host == baseUrl.host || isHostMatch)) {
         resolved = resolved.replace(query: baseUrl.query);
       }
-      return getProxyUrl(
+      final proxyUrl = getProxyUrl(
         resolved.toString(),
         headers: stickyHeaders,
         options: options,
-      ); // Recursive proxy with headers and options
+      );
+      // FFmpeg's HLS demuxer calls av_match_ext(url, allowed_extensions) on
+      // segment URLs. It uses strrchr(url, '.') to extract the extension, so
+      // the LAST dot in the full proxy URL string determines what extension
+      // FFmpeg sees. Without this suffix the last dot lands inside the
+      // percent-encoded CDN path (e.g. ...5795_000.js%3Fin%3D...&h=BASE64)
+      // giving an extension like "js%3F..." which matches nothing.
+      // Appending &_ext=.ts makes strrchr find ".ts" — which IS in FFmpeg's
+      // default allowed_extensions whitelist. Audio rendition segments skip
+      // this check (separate child AVFormatContext path), explaining why audio
+      // worked but video was silently blocked.
+      // The proxy ignores _ext; it only reads url/h/o query params.
+      return isSegment ? '$proxyUrl&_ext=.ts' : proxyUrl;
     } catch (e) {
       return uri;
     }

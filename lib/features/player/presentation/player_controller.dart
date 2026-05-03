@@ -438,6 +438,9 @@ class PlayerController extends Notifier<PlayerState> {
   bool _hasConfirmedPlaybackFrame = false;
   bool _suppressNextEpisodeDetection = false;
   bool _manualSelectionPending = false;
+  // Audio tracks that have already failed with decode errors for the current
+  // stream. When one track fails, we try the next one before source-switching.
+  final Set<String> _failedAudioTrackIds = {};
 
   String _phaseTitle([String? fallback]) {
     if (state.playerTitle.isNotEmpty) return state.playerTitle;
@@ -1097,6 +1100,35 @@ class PlayerController extends Notifier<PlayerState> {
       if (kDebugMode) debugPrint("Player Error: $error");
       if (error.toString().toLowerCase().contains("abort")) return;
 
+      final isAudioDecodeError = error
+          .toString()
+          .toLowerCase()
+          .contains('decoding audio');
+
+      // HE-AAC (AAC+SBR) streams trigger "Error decoding audio" because
+      // FFmpeg initializes the codec in AAC-LC mode and then encounters SBR
+      // extension data. Rather than switching the whole source, try each
+      // audio rendition in turn — the next track is typically stereo AAC-LC
+      // and decodes correctly (matches what the user gets by manually
+      // switching the audio track in the UI).
+      if (isAudioDecodeError && !state.isLive) {
+        _failedAudioTrackIds.add(_player.state.track.audio.id.toString());
+        final nextTrack = _player.state.tracks.audio.firstWhereOrNull(
+          (t) => !_failedAudioTrackIds.contains(t.id.toString()),
+        );
+        if (nextTrack != null) {
+          if (kDebugMode) {
+            debugPrint('[Player] Audio decode error — trying next audio track: ${nextTrack.id} (${nextTrack.language})');
+          }
+          _player.setAudioTrack(nextTrack).catchError((_) {});
+          return;
+        }
+        // All available tracks exhausted — fall through to source switch.
+        if (kDebugMode) {
+          debugPrint('[Player] All audio tracks failed, switching source.');
+        }
+      }
+
       if (!_hasConfirmedPlaybackFrame ||
           _player.state.position == Duration.zero) {
         // Error before playback confirmed — try next source.
@@ -1673,6 +1705,8 @@ class PlayerController extends Notifier<PlayerState> {
     if (state.useExoPlayer) {
       _videoViewController?.close();
     }
+
+    _failedAudioTrackIds.clear();
 
     // FFmpeg's HLS demuxer opens audio rendition playlists as separate
     // AVFormatContext instances that do NOT inherit parent HTTP headers on any
@@ -3147,15 +3181,22 @@ class PlayerController extends Notifier<PlayerState> {
     }
   }
 
-  /// Fetches [masterUrl] and rewrites ONLY the audio rendition URI= attributes
-  /// Fetches [masterUrl], strips all EXT-X-MEDIA AUDIO entries except the
-  /// preferred one (DEFAULT=YES → AUTOSELECT=YES → first), rewrites every URL
-  /// in the playlist (audio URI, variant stream URLs) to localhost proxy URLs,
-  /// and returns the simplified playlist string.
+  /// Fetches [masterUrl], proxies all audio rendition URIs and variant stream
+  /// URLs through localhost, and returns a rewritten playlist.
   ///
-  /// This reduces FFmpeg's HLS probe phase from N × probe_time (one per audio
-  /// rendition) to 1 × probe_time, while still injecting cookies for all
-  /// sub-requests via the local proxy.
+  /// Keeps up to [_kMaxProxiedAudioTracks] audio renditions. When there are
+  /// more renditions than that limit, only the highest-priority ones are kept —
+  /// which prevents FFmpeg from probing every rendition (11 tracks × ~5 s =
+  /// 55 s startup delay).
+  ///
+  /// Priority scoring:
+  ///   lang param match  +4   (e.g. URL has ?lang=eng → prefer LANGUAGE="en*")
+  ///   DEFAULT=YES       +2
+  ///   AUTOSELECT=YES    +1
+  ///
+  /// The top-ranked track is emitted first and forced to DEFAULT=YES so mpv
+  /// selects it automatically. This prevents picking an HE-AAC/5.1 original-
+  /// language track when the user requested a stereo AAC-LC dubbed track.
   ///
   /// Returns null if the master playlist can't be fetched.
   Future<String?> _buildSimplifiedMasterPlaylist(
@@ -3163,6 +3204,12 @@ class PlayerController extends Notifier<PlayerState> {
     Map<String, String> headers,
     ProxyOptions proxyOptions,
   ) async {
+    // Probe-time guard: each audio rendition adds ~3-5 s to FFmpeg's probe phase.
+    // Three renditions covers primary + secondary language + fallback while
+    // keeping startup time under ~15 s. Streams with more renditions (e.g. 11)
+    // only expose the top three.
+    const maxAudioTracks = 3;
+
     try {
       final response = await http.get(Uri.parse(masterUrl), headers: headers);
       if (response.statusCode < 200 || response.statusCode >= 300) return null;
@@ -3170,48 +3217,75 @@ class PlayerController extends Notifier<PlayerState> {
       final baseUri = Uri.parse(masterUrl);
       final lines = response.body.split('\n');
 
-      // Find the single preferred audio track line.
-      // Priority: DEFAULT=YES > AUTOSELECT=YES > first occurrence.
-      String? preferredAudioLine;
-      int preferredScore = -1;
+      // Extract the lang hint from the URL (e.g. ?lang=eng → 'eng').
+      final langHint = baseUri.queryParameters['lang']?.toLowerCase();
+
+      // Score every audio rendition line so we can rank them.
+      final allAudio = <(String line, int score)>[];
       for (final line in lines) {
         final t = line.trim();
         if (!t.startsWith('#EXT-X-MEDIA:') || !t.contains('TYPE=AUDIO')) {
           continue;
         }
-        final isDefault = t.contains('DEFAULT=YES');
-        final isAutoselect = t.contains('AUTOSELECT=YES');
-        final score = isDefault
-            ? 2
-            : isAutoselect
-            ? 1
-            : 0;
-        if (score > preferredScore) {
-          preferredScore = score;
-          preferredAudioLine = t;
-          if (isDefault) break;
+        int score = 0;
+        if (t.contains('DEFAULT=YES')) score += 2;
+        if (t.contains('AUTOSELECT=YES')) score += 1;
+        if (langHint != null) {
+          final m = RegExp(
+            r'LANGUAGE="([^"]*)"',
+            caseSensitive: false,
+          ).firstMatch(t);
+          if (m != null) {
+            // Match across ISO 639-1/2 variants: 'eng' matches 'en' and vice-versa.
+            final lang = m.group(1)!.toLowerCase();
+            if (lang.startsWith(langHint) || langHint.startsWith(lang)) {
+              score += 4;
+            }
+          }
         }
+        allAudio.add((t, score));
       }
 
+      // Sort descending by score; slice to limit.
+      allAudio.sort((a, b) => b.$2.compareTo(a.$2));
+      final kept = allAudio.take(maxAudioTracks).toList();
+
+      // Rebuild the playlist, replacing audio lines in score-sorted order.
       final result = <String>[];
+      int audioEmitted = 0;
       for (final line in lines) {
         final t = line.trim();
 
-        // Audio rendition lines: keep only the preferred one (with proxied URI).
         if (t.startsWith('#EXT-X-MEDIA:') && t.contains('TYPE=AUDIO')) {
-          if (preferredAudioLine != null && t == preferredAudioLine) {
-            result.add(
-              t.replaceAllMapped(RegExp(r'URI="([^"]+)"'), (m) {
+          if (audioEmitted < kept.length) {
+            // Proxy the URI= attribute.
+            var out = kept[audioEmitted].$1.replaceAllMapped(
+              RegExp(r'URI="([^"]+)"'),
+              (m) {
                 final resolved = baseUri.resolve(m.group(1)!).toString();
                 return 'URI="${LocalProxyService.instance.getProxyUrl(resolved, headers: headers, options: proxyOptions)}"';
-              }),
+              },
             );
+            if (audioEmitted == 0) {
+              // Top-ranked track must be DEFAULT so mpv picks it first.
+              out = out.contains('DEFAULT=')
+                  ? out.replaceFirst(RegExp(r'DEFAULT=\w+'), 'DEFAULT=YES')
+                  : out.replaceFirst(
+                      '#EXT-X-MEDIA:',
+                      '#EXT-X-MEDIA:DEFAULT=YES,',
+                    );
+            } else {
+              // Non-primary tracks must not override the top track as default.
+              out = out.replaceFirst(RegExp(r'DEFAULT=YES'), 'DEFAULT=NO');
+            }
+            result.add(out);
+            audioEmitted++;
           }
-          // All other audio rendition lines are dropped.
+          // Any audio line beyond our limit is dropped.
           continue;
         }
 
-        // Non-comment, non-empty lines are variant/segment URLs — proxy them.
+        // Non-comment, non-empty lines are variant stream URLs — proxy them.
         if (t.isNotEmpty && !t.startsWith('#')) {
           final resolved = baseUri.resolve(t).toString();
           result.add(
@@ -3228,22 +3302,15 @@ class PlayerController extends Notifier<PlayerState> {
       }
 
       if (kDebugMode) {
-        final audioKept = preferredAudioLine != null ? 1 : 0;
-        final audioTotal = lines
-            .where(
-              (l) =>
-                  l.trim().startsWith('#EXT-X-MEDIA:') &&
-                  l.contains('TYPE=AUDIO'),
-            )
-            .length;
         debugPrint(
-          '[PLAYER] Simplified HLS master: kept $audioKept/$audioTotal audio tracks',
+          '[PLAYER] Simplified HLS master: kept ${kept.length}/${allAudio.length} audio tracks',
         );
       }
       return result.join('\n');
     } catch (e) {
-      if (kDebugMode)
+      if (kDebugMode) {
         debugPrint('[PLAYER] _buildSimplifiedMasterPlaylist error: $e');
+      }
       return null;
     }
   }
