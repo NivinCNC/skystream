@@ -276,21 +276,12 @@ class LocalProxyService {
         );
       }
 
-      request.response.statusCode = response.statusCode;
-
-      // Copy ALL relevant headers from source response
-      response.headers.forEach((name, values) {
-        final lowerName = name.toLowerCase();
-        if (lowerName != 'transfer-encoding' &&
-            lowerName != 'access-control-allow-origin') {
-          for (final value in values) {
-            request.response.headers.add(name, value);
-          }
-        }
-      });
-      request.response.headers.add("Access-Control-Allow-Origin", "*");
-
-      // RECURSIVE REWRITE for M3U8
+      // Detect M3U8 BEFORE copying response headers. Rewriting expands all
+      // segment/rendition URLs, so the rewritten body is much larger than the
+      // original. If we copy Content-Length first and then try to remove it,
+      // Dart's HttpResponse has already stored the value internally and still
+      // enforces the limit — causing "Content size exceeds specified
+      // contentLength" when we write the larger rewritten body.
       final isResponseM3u8 = _isM3u8(
         response.headers.contentType?.mimeType,
         targetUrl,
@@ -299,17 +290,35 @@ class LocalProxyService {
         debugPrint("[PROXY] Detected isM3u8: $isResponseM3u8 for $targetUrl");
       }
 
+      request.response.statusCode =
+          (isResponseM3u8 &&
+              (response.statusCode == 200 || response.statusCode == 206))
+          ? 200
+          : response.statusCode;
+
+      // Copy response headers; skip content-length and content-encoding for
+      // M3U8 responses since the rewritten body has a different size/encoding.
+      response.headers.forEach((name, values) {
+        final lowerName = name.toLowerCase();
+        final skipForM3u8 =
+            isResponseM3u8 &&
+            (lowerName == 'content-length' || lowerName == 'content-encoding');
+        if (lowerName != 'transfer-encoding' &&
+            lowerName != 'access-control-allow-origin' &&
+            !skipForM3u8) {
+          for (final value in values) {
+            request.response.headers.add(name, value);
+          }
+        }
+      });
+      request.response.headers.add("Access-Control-Allow-Origin", "*");
+
       // Allow rewriting for 200 (OK) and 206 (Partial) if it's an M3U8
       if (isResponseM3u8 &&
           (response.statusCode == 200 || response.statusCode == 206)) {
         if (kDebugMode) {
           debugPrint("[PROXY] Triggering M3U8 rewrite for: $targetUrl");
         }
-        // If rewriting, we must remove content-encoding and content-length
-        // because the modified body will have different length/type.
-        request.response.headers.removeAll('content-encoding');
-        request.response.headers.removeAll('content-length');
-        request.response.statusCode = 200; // Force 200 for rewritten content
         request.response.headers.contentType = ContentType(
           "application",
           "vnd.apple.mpegurl",
@@ -322,8 +331,7 @@ class LocalProxyService {
           options,
         );
       } else {
-        // if (isResponseM3u8) debugPrint("[PROXY] Skipping rewrite (status ${response.statusCode})");
-        // Pipe binary data
+        // Pipe binary data (segments, keys, etc.)
         await response.pipe(request.response);
       }
     } catch (e) {
@@ -531,8 +539,13 @@ class LocalProxyService {
   bool _isValidM3u8(List<int> bytes) {
     try {
       if (bytes.length > 4) {
-        final content = utf8.decode(bytes.take(50).toList(), allowMalformed: true).trim();
-        if (kDebugMode) debugPrint("[PROXY] M3U8 Validation Check: '${content.substring(0, content.length > 10 ? 10 : content.length)}...'");
+        final content = utf8
+            .decode(bytes.take(50).toList(), allowMalformed: true)
+            .trim();
+        if (kDebugMode)
+          debugPrint(
+            "[PROXY] M3U8 Validation Check: '${content.substring(0, content.length > 10 ? 10 : content.length)}...'",
+          );
         return content.contains("#EXT");
       }
     } catch (e) {

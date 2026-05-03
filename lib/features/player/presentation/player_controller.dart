@@ -342,13 +342,18 @@ class PlayerController extends Notifier<PlayerState> {
   VideoController? get videoViewController => _videoViewController;
   bool get isDisposed => _isDisposed;
   PlayerState get currentState => state;
-  List<SubtitleFile> get userAddedExternalSubtitles => _userAddedExternalSubtitles;
+  List<SubtitleFile> get userAddedExternalSubtitles =>
+      _userAddedExternalSubtitles;
 
-  Set<String>? get pendingVideoViewSubtitleIdsBeforeReload => _pendingVideoViewSubtitleIdsBeforeReload;
-  set pendingVideoViewSubtitleIdsBeforeReload(Set<String>? values) => _pendingVideoViewSubtitleIdsBeforeReload = values;
+  Set<String>? get pendingVideoViewSubtitleIdsBeforeReload =>
+      _pendingVideoViewSubtitleIdsBeforeReload;
+  set pendingVideoViewSubtitleIdsBeforeReload(Set<String>? values) =>
+      _pendingVideoViewSubtitleIdsBeforeReload = values;
 
-  bool get selectNewestVideoViewSubtitleAfterReload => _selectNewestVideoViewSubtitleAfterReload;
-  set selectNewestVideoViewSubtitleAfterReload(bool value) => _selectNewestVideoViewSubtitleAfterReload = value;
+  bool get selectNewestVideoViewSubtitleAfterReload =>
+      _selectNewestVideoViewSubtitleAfterReload;
+  set selectNewestVideoViewSubtitleAfterReload(bool value) =>
+      _selectNewestVideoViewSubtitleAfterReload = value;
 
   void updateState(PlayerState Function(PlayerState s) update) {
     state = update(state);
@@ -1628,7 +1633,8 @@ class PlayerController extends Notifier<PlayerState> {
       if (Platform.isWindows) {
         final scheme = Uri.tryParse(finalUrl)?.scheme ?? '';
         final lowerUrl = finalUrl.toLowerCase();
-        final hasAdaptiveExtension = lowerUrl.contains('.m3u8') ||
+        final hasAdaptiveExtension =
+            lowerUrl.contains('.m3u8') ||
             lowerUrl.contains('.mpd') ||
             lowerUrl.contains('.ism/manifest');
         if (hasAdaptiveExtension &&
@@ -1668,7 +1674,56 @@ class PlayerController extends Notifier<PlayerState> {
       _videoViewController?.close();
     }
 
-    await _player.open(Media(playUrl, httpHeaders: headers));
+    // FFmpeg's HLS demuxer opens audio rendition playlists as separate
+    // AVFormatContext instances that do NOT inherit parent HTTP headers on any
+    // platform. For HLS with cookie-auth audio renditions, we pre-process the
+    // master playlist to keep only the DEFAULT audio track and proxy all URLs
+    // through localhost (so the proxy injects cookies for every sub-request).
+    // Keeping 1 audio track instead of 11 reduces probe time from ~27s to ~3s.
+    String mediaKitUrl = playUrl;
+    final lowerPlayUrl = playUrl.toLowerCase();
+    final isHlsUrl =
+        lowerPlayUrl.contains('.m3u8') ||
+        (lowerPlayUrl.contains('/hls/') && !lowerPlayUrl.startsWith('file'));
+    final lowerHdrs = headers.map((k, v) => MapEntry(k.toLowerCase(), v));
+    if (isHlsUrl && lowerHdrs.containsKey('cookie')) {
+      final cookieNames = lowerHdrs['cookie']!
+          .split(';')
+          .map((c) => c.trim().split('=').first.trim())
+          .where((s) => s.isNotEmpty)
+          .toList();
+      final proxyOptions = ProxyOptions(
+        mirrorHosts: const [],
+        keepCookies: cookieNames,
+      );
+      final simplified = await _buildSimplifiedMasterPlaylist(
+        playUrl,
+        headers,
+        proxyOptions,
+      );
+      if (simplified != null) {
+        mediaKitUrl = LocalProxyService.instance.serveM3u8(simplified);
+        if (kDebugMode) {
+          debugPrint(
+            '[PLAYER] Serving simplified HLS master (1 audio track): $mediaKitUrl',
+          );
+        }
+      } else {
+        // Fallback: full proxy if pre-fetch failed (e.g. network error)
+        mediaKitUrl = LocalProxyService.instance.getProxyUrl(
+          playUrl,
+          headers: headers,
+          options: proxyOptions,
+        );
+        if (kDebugMode) {
+          debugPrint(
+            '[PLAYER] Proxying HLS through localhost (master pre-fetch failed): $mediaKitUrl',
+          );
+        }
+      }
+    }
+
+    await _player.open(Media(mediaKitUrl, httpHeaders: headers));
     state = state.copyWith(useExoPlayer: false, isSeekable: true);
   }
 
@@ -1936,9 +1991,7 @@ class PlayerController extends Notifier<PlayerState> {
 
     final stream = state.streams[index];
     final rawProviderName =
-        _item.provider ??
-        ref.read(activeProviderProvider)?.name ??
-        "Unknown";
+        _item.provider ?? ref.read(activeProviderProvider)?.name ?? "Unknown";
     final providerName = _getProviderDisplayName(rawProviderName);
     final subtitles = _effectiveExternalSubtitles(stream.subtitles);
     final attemptTotal = state.sourceAttempts.isEmpty
@@ -2155,9 +2208,7 @@ class PlayerController extends Notifier<PlayerState> {
     }
 
     final rawPName =
-        _item.provider ??
-        ref.read(activeProviderProvider)?.name ??
-        'Unknown';
+        _item.provider ?? ref.read(activeProviderProvider)?.name ?? 'Unknown';
     final pName = _getProviderDisplayName(rawPName);
 
     // Capture current position before we switch engines/streams.
@@ -2825,10 +2876,44 @@ class PlayerController extends Notifier<PlayerState> {
     // Debug: log what DRM fields the stream has so failures are traceable.
     if (kDebugMode) {
       debugPrint(
-        '[DRM] stream drmKid=${stream.drmKid} '
-        'drmKey=${stream.drmKey} '
+        '[Player] Opening stream — url=${stream.url} '
+        'source=${stream.source} '
+        'isLive=${_isLiveStream(stream.url)} '
+        'drmKid=${stream.drmKid} drmKey=${stream.drmKey} '
         'licenseUrl=${stream.licenseUrl}',
       );
+      debugPrint('[Player] Headers for stream: $headers');
+      // Enable mpv internal log for every stream so HLS variant selection
+      // and segment fetch errors appear in logcat regardless of live/VOD.
+      _logSub ??= _player.stream.log.listen((log) {
+        // Always forward warn/error/fatal; also forward verbose hls/lavf lines
+        // that match keywords useful for diagnosing auth / track selection issues.
+        if (log.level == 'warn' ||
+            log.level == 'error' ||
+            log.level == 'fatal' ||
+            log.text.contains('hls') ||
+            log.text.contains('m3u8') ||
+            log.text.contains('variant') ||
+            log.text.contains('rendition') ||
+            log.text.contains('opening') ||
+            log.text.contains('Opening') ||
+            log.text.contains('lavf') ||
+            log.text.contains('audio') ||
+            log.text.contains('video') ||
+            log.text.contains('track') ||
+            log.text.contains('stream') ||
+            log.text.contains('codec') ||
+            log.text.contains('403') ||
+            log.text.contains('404') ||
+            log.text.contains('401') ||
+            log.text.contains('redirect') ||
+            log.text.contains('cookie') ||
+            log.text.contains('header') ||
+            log.text.contains('http://') ||
+            log.text.contains('https://')) {
+          debugPrint('[MPV/${log.level}] ${log.text}');
+        }
+      });
     }
 
     if (_player.platform is NativePlayer) {
@@ -2884,6 +2969,24 @@ class PlayerController extends Notifier<PlayerState> {
       // earlier ones (e.g. live reconnect seg_max_retry).
       final demuxerLavfOpts = <String>[];
 
+      // Propagate auth headers to lavf's internal HTTP client.
+      // http-header-fields only covers mpv's stream layer; lavf's HLS demuxer
+      // fetches EXT-X-MAP init segments, child playlists, and alternate audio
+      // rendition playlists through its own HTTP context.
+      //
+      // We use 'headers=Cookie: VALUE\r\n' (not 'cookies=VALUE') because:
+      // - cookies= is parsed as Set-Cookie syntax: 't_hash_t=A; ott=nf; hd=on'
+      //   treats '; ott=nf' as a cookie attribute, so only 't_hash_t' is sent.
+      //   The CDN needs the full cookie string including ott and hd.
+      // - A single-header headers= entry with CRLF only at the END is safe from
+      //   mpv's comma-list parser (embedded mid-value CRLF would split incorrectly).
+      // - demuxer-lavf-o only supports ONE 'headers=' key (later overwrites earlier),
+      //   so we pack only Cookie here; Referer is covered by http-header-fields for
+      //   the top-level fetch and is less critical for CDN segment auth.
+      if (lowerHeaders.containsKey('cookie')) {
+        demuxerLavfOpts.add('headers=Cookie: ${lowerHeaders['cookie']!}\r\n');
+      }
+
       final isLivePattern =
           _isLiveStream(stream.url) ||
           _item.contentType == MultimediaContentType.livestream;
@@ -2921,18 +3024,43 @@ class PlayerController extends Notifier<PlayerState> {
         // H.264 resilience: wait for clean keyframe after reconnect
         await native.setProperty('vd-lavc-skiploopfilter', 'nonkey');
         await native.setProperty('vd-lavc-skipframe', 'nonref');
-
-        if (kDebugMode && _logSub == null) {
-          _logSub = _player.stream.log.listen((log) {
-            debugPrint('[MPV] ${log.level}: ${log.text}');
-          });
-        }
       } else {
         final settings = ref.read(playerSettingsProvider).asData?.value;
         final readahead = settings?.readaheadSeconds ?? 180;
         await native.setProperty('demuxer-readahead-secs', '$readahead');
         await native.setProperty('cache-secs', '$readahead');
         await native.setProperty('cache', 'yes');
+
+        // Force mpv to select the highest-bandwidth HLS variant so it never
+        // picks an audio-only rendition when the master playlist lists one first.
+        await native.setProperty('hls-bitrate', 'max');
+
+        // Allow segment URLs with any file extension (ts, mp4, m4s, no-ext…).
+        // FFmpeg's HLS demuxer silently drops segments whose extension isn't on
+        // its whitelist, causing audio-only playback when video segments use
+        // non-standard extensions.
+        demuxerLavfOpts.add('allowed_extensions=ALL');
+
+        // HLS manifests declare codec/language via EXT-X-MEDIA and EXT-X-MAP
+        // tags, so FFmpeg doesn't need deep probing to detect streams. The
+        // global 32MB/30s values cause ~27s delay when all audio renditions are
+        // probed through the local proxy before video starts.
+        final isHlsStream =
+            stream.url.toLowerCase().contains('.m3u8') ||
+            stream.url.toLowerCase().contains('/hls/');
+        if (isHlsStream) {
+          // 5MB covers a full 1080p fMP4 video segment (~4-8Mbps × 1s) for
+          // codec detection without reading multiple segments per track.
+          // 5s is enough for EXT-X-MEDIA / EXT-X-MAP based HLS streams.
+          await native.setProperty('demuxer-lavf-probesize', '5242880'); // 5MB
+          await native.setProperty('demuxer-lavf-analyzeduration', '5'); // 5s
+        } else {
+          await native.setProperty(
+            'demuxer-lavf-probesize',
+            '33554432',
+          ); // 32MB
+          await native.setProperty('demuxer-lavf-analyzeduration', '30'); // 30s
+        }
       }
 
       // Adaptive demuxer cache based on device profile.
@@ -3006,10 +3134,117 @@ class PlayerController extends Notifier<PlayerState> {
           await cookieFile.create();
         }
         await native.setProperty('cookies-file', cookieFile.path);
-        // Note: 'cookies-file-access' is not a valid MPV property and is omitted.
+
+        // Set a writable cache dir so mpv can persist its seek-backward and
+        // init-segment cache to disk. Without this, mpv logs "Failed to create
+        // file cache" and must re-fetch EXT-X-MAP init segments every time they
+        // are needed; if the CDN expires the init segment URL (404) before the
+        // next re-fetch, audio/video stops (typically ~20 s into playback).
+        await native.setProperty('cache-dir', tempDir.path);
       } catch (e) {
-        if (kDebugMode) debugPrint('Failed to set cookies-file: $e');
+        if (kDebugMode) debugPrint('Failed to set cache-dir/cookies-file: $e');
       }
+    }
+  }
+
+  /// Fetches [masterUrl] and rewrites ONLY the audio rendition URI= attributes
+  /// Fetches [masterUrl], strips all EXT-X-MEDIA AUDIO entries except the
+  /// preferred one (DEFAULT=YES → AUTOSELECT=YES → first), rewrites every URL
+  /// in the playlist (audio URI, variant stream URLs) to localhost proxy URLs,
+  /// and returns the simplified playlist string.
+  ///
+  /// This reduces FFmpeg's HLS probe phase from N × probe_time (one per audio
+  /// rendition) to 1 × probe_time, while still injecting cookies for all
+  /// sub-requests via the local proxy.
+  ///
+  /// Returns null if the master playlist can't be fetched.
+  Future<String?> _buildSimplifiedMasterPlaylist(
+    String masterUrl,
+    Map<String, String> headers,
+    ProxyOptions proxyOptions,
+  ) async {
+    try {
+      final response = await http.get(Uri.parse(masterUrl), headers: headers);
+      if (response.statusCode < 200 || response.statusCode >= 300) return null;
+
+      final baseUri = Uri.parse(masterUrl);
+      final lines = response.body.split('\n');
+
+      // Find the single preferred audio track line.
+      // Priority: DEFAULT=YES > AUTOSELECT=YES > first occurrence.
+      String? preferredAudioLine;
+      int preferredScore = -1;
+      for (final line in lines) {
+        final t = line.trim();
+        if (!t.startsWith('#EXT-X-MEDIA:') || !t.contains('TYPE=AUDIO')) {
+          continue;
+        }
+        final isDefault = t.contains('DEFAULT=YES');
+        final isAutoselect = t.contains('AUTOSELECT=YES');
+        final score = isDefault
+            ? 2
+            : isAutoselect
+            ? 1
+            : 0;
+        if (score > preferredScore) {
+          preferredScore = score;
+          preferredAudioLine = t;
+          if (isDefault) break;
+        }
+      }
+
+      final result = <String>[];
+      for (final line in lines) {
+        final t = line.trim();
+
+        // Audio rendition lines: keep only the preferred one (with proxied URI).
+        if (t.startsWith('#EXT-X-MEDIA:') && t.contains('TYPE=AUDIO')) {
+          if (preferredAudioLine != null && t == preferredAudioLine) {
+            result.add(
+              t.replaceAllMapped(RegExp(r'URI="([^"]+)"'), (m) {
+                final resolved = baseUri.resolve(m.group(1)!).toString();
+                return 'URI="${LocalProxyService.instance.getProxyUrl(resolved, headers: headers, options: proxyOptions)}"';
+              }),
+            );
+          }
+          // All other audio rendition lines are dropped.
+          continue;
+        }
+
+        // Non-comment, non-empty lines are variant/segment URLs — proxy them.
+        if (t.isNotEmpty && !t.startsWith('#')) {
+          final resolved = baseUri.resolve(t).toString();
+          result.add(
+            LocalProxyService.instance.getProxyUrl(
+              resolved,
+              headers: headers,
+              options: proxyOptions,
+            ),
+          );
+          continue;
+        }
+
+        result.add(line);
+      }
+
+      if (kDebugMode) {
+        final audioKept = preferredAudioLine != null ? 1 : 0;
+        final audioTotal = lines
+            .where(
+              (l) =>
+                  l.trim().startsWith('#EXT-X-MEDIA:') &&
+                  l.contains('TYPE=AUDIO'),
+            )
+            .length;
+        debugPrint(
+          '[PLAYER] Simplified HLS master: kept $audioKept/$audioTotal audio tracks',
+        );
+      }
+      return result.join('\n');
+    } catch (e) {
+      if (kDebugMode)
+        debugPrint('[PLAYER] _buildSimplifiedMasterPlaylist error: $e');
+      return null;
     }
   }
 

@@ -86,3 +86,4 @@ plugins/
 keystore/
 skystream-plugins/
 skystream-tools/
+tree-shaking-test*.js
