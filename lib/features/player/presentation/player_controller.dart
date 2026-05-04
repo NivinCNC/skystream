@@ -1199,8 +1199,9 @@ class PlayerController extends Notifier<PlayerState> {
             '[Player] All audio tracks failed — disabling audio to preserve video playback.',
           );
         }
-        final noTrack = _player.state.tracks.audio
-            .firstWhereOrNull((t) => t.id == 'no');
+        final noTrack = _player.state.tracks.audio.firstWhereOrNull(
+          (t) => t.id == 'no',
+        );
         if (noTrack != null) {
           _player.setAudioTrack(noTrack).catchError((_) {});
         }
@@ -3145,10 +3146,15 @@ class PlayerController extends Notifier<PlayerState> {
         await native.setProperty('cache-secs', '$readahead');
         await native.setProperty('cache', 'yes');
 
-        // Allow backward seeks even when mpv's stream layer reports the source
-        // as non-seekable (e.g. HTTP streams missing Content-Length). mpv will
-        // use its demuxer cache for backwards seeks within the cached window and
-        // fall back to a forward re-read if the target is outside the cache.
+        // Tell FFmpeg's HTTP stream handler to treat the connection as
+        // byte-seekable. This propagates seekability all the way to the demuxer
+        // so mpv maintains its back-cache (demuxer-max-back-bytes) and performs
+        // instant cache-based backward seeks. Without this, streams routed
+        // through the local proxy are treated as "linear" — mpv refuses backward
+        // seeks and has to re-read forward to reach the target position.
+        // force-seekable=yes is a belt-and-suspenders override at the player
+        // level; seekable=1 fixes it at the stream/demuxer level.
+        await native.setProperty('stream-lavf-o', 'seekable=1');
         await native.setProperty('force-seekable', 'yes');
 
         // Force mpv to select the highest-bandwidth HLS variant so it never
@@ -3330,7 +3336,7 @@ class PlayerController extends Notifier<PlayerState> {
         allAudio.add((t, score));
       }
 
-      // Sort descending by score; keep all (lang-preferred first, then DEFAULT).
+      // Sort descending by score; keep all (lang-preferred first, then DEFAULT)
       allAudio.sort((a, b) => b.$2.compareTo(a.$2));
       final kept = allAudio;
 

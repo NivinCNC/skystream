@@ -192,21 +192,23 @@ class LocalProxyService {
       }
     }
 
+    // Check if this is an M3U8 request to handle Range headers and rewriting
+    final isRequestM3u8 = targetUrl.toLowerCase().contains(".m3u8");
+
     final client = HttpClient();
-    // true: Dart decompresses gzip responses and strips Content-Encoding from
-    // response headers — required so M3U8 content arrives as UTF-8 text we can
-    // parse and rewrite. The CDN sends gzip even without an explicit
-    // Accept-Encoding request header. Content-Length is NOT updated to reflect
-    // the decompressed size, so we MUST strip content-length from all proxy
-    // responses (see header copy loop below) to avoid ContentSizeException.
-    client.autoUncompress = true;
+    // For M3U8: autoUncompress=true so gzip-encoded playlists arrive as UTF-8
+    // text we can parse and rewrite. Content-Length is stripped for M3U8
+    // responses (body is rewritten, size changes).
+    //
+    // For binary video (MKV, MP4, TS): autoUncompress=false so Dart never
+    // injects "Accept-Encoding: gzip" on the outgoing request. CDNs treat
+    // gzip + Range as incompatible and return 200 (full file) instead of 206
+    // (partial), which breaks seeking.
+    client.autoUncompress = isRequestM3u8;
     client.badCertificateCallback = (cert, host, port) => true;
 
     try {
       final req = await client.getUrl(Uri.parse(targetUrl));
-
-      // Check if this is an M3U8 request to handle Range headers and rewriting
-      final isRequestM3u8 = targetUrl.toLowerCase().contains(".m3u8");
 
       // 1. Process incoming request headers first (Player headers)
       final Map<String, String> mergedCookies = {};
@@ -269,7 +271,18 @@ class LocalProxyService {
       // 4. Sanitize and Default Headers
       _applySanitizedHeaders(req, targetUrl, options);
 
-      // debugPrint("[PROXY] Fetching with headers: ${req.headers}");
+      // Dart's HttpClient (autoUncompress=true) injects "Accept-Encoding: gzip"
+      // on every outgoing request. CDNs treat gzip + Range as incompatible and
+      // fall back to a 200 full-file response instead of 206, breaking seeks.
+      req.headers.set('accept-encoding', 'identity');
+
+      if (kDebugMode) {
+        final rangeHeader = req.headers.value('range');
+        if (rangeHeader != null) {
+          debugPrint('[PROXY] Range request: $rangeHeader → $targetUrl');
+          debugPrint('[PROXY] accept-encoding: ${req.headers.value('accept-encoding')}');
+        }
+      }
       final response = await _fetchWithRedirects(
         client,
         req,
@@ -277,6 +290,10 @@ class LocalProxyService {
         options,
       );
       if (kDebugMode) {
+        final rangeHeader = req.headers.value('range');
+        if (rangeHeader != null) {
+          debugPrint('[PROXY] CDN responded: ${response.statusCode}, content-range: ${response.headers.value('content-range')}');
+        }
         debugPrint(
           "[PROXY] Response Status: ${response.statusCode}, Content-Type: ${response.headers.contentType}",
         );

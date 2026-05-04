@@ -388,6 +388,7 @@ class _SourceAttemptListState extends State<_SourceAttemptList> {
   Widget build(BuildContext context) {
     final list = ListView.separated(
       controller: _controller,
+      padding: EdgeInsets.zero,
       shrinkWrap: true,
       itemCount: widget.attempts.length,
       separatorBuilder: (_, _) =>
